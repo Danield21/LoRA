@@ -9,13 +9,39 @@ import torch.nn.functional as F
 import math
 from typing import Optional, List
 
+import math
+from typing import Optional, List
+import random
+import os
+import numpy as np
+def seed_torch(seed=4):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed) # 为了禁止hash随机化，使得实验可复现
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+	torch.backends.cudnn.benchmark = False
+	torch.backends.cudnn.deterministic = True
+
+
 class LoRALayer():
+    '''
+    For Embedding, the init_state can be: 
+        (A_zero_B_normal, seed), (A_normal_B_zero,seed), (random_BA,seed)
+    For Linear, the init_state can be:
+        (A_zero_B_kaiming, seed), (A_kaiming_B_zero,seed), (random_BA,seed)  
+    
+    '''
     def __init__(
         self, 
         r: int, 
         lora_alpha: int, 
         lora_dropout: float,
         merge_weights: bool,
+        init_state: tuple,
+        use_scaling: bool,
+        frozen_part: str    #we can set frozen part as A or B
     ):
         self.r = r
         self.lora_alpha = lora_alpha
@@ -27,7 +53,10 @@ class LoRALayer():
         # Mark the weight as unmerged
         self.merged = False
         self.merge_weights = merge_weights
-
+        self.use_scaling=use_scaling
+        self.init_seed=init_state[-1]
+        self.init_method=init_state[0]
+        self.frozen_part=frozen_part 
 
 class Embedding(nn.Embedding, LoRALayer):
     # LoRA implemented in a dense layer
@@ -38,26 +67,47 @@ class Embedding(nn.Embedding, LoRALayer):
         r: int = 0,
         lora_alpha: int = 1,
         merge_weights: bool = True,
+        init_state: tuple = ('A_zero_B_normal',4),
+        use_scaling: bool = True,
+        frozen_part: str = None,
         **kwargs
     ):
         nn.Embedding.__init__(self, num_embeddings, embedding_dim, **kwargs)
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=0,
-                           merge_weights=merge_weights)
+                           merge_weights=merge_weights,init_state=init_state,
+                           use_scaling=use_scaling,frozen_part=frozen_part)
         # Actual trainable parameters
         if r > 0:
             self.lora_A = nn.Parameter(self.weight.new_zeros((r, num_embeddings)))
             self.lora_B = nn.Parameter(self.weight.new_zeros((embedding_dim, r)))
-            self.scaling = self.lora_alpha / self.r
+            if self.use_scaling:
+                self.scaling = self.lora_alpha / self.r
+            else:
+                self.scaling = 1
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
+            if self.frozen_part == 'A':
+                self.lora_A.requires_grad = False
+            elif self.frozen_part=='B':
+                self.lora_B.requires_grad = False
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.Embedding.reset_parameters(self)
         if hasattr(self, 'lora_A'):
-            # initialize A the same way as the default for nn.Linear and B to zero
-            nn.init.zeros_(self.lora_A)
-            nn.init.normal_(self.lora_B)
+            seed_torch(self.init_seed)
+            if self.init_method=='A_zero_B_normal' or self.frozen_part=='B':
+                # initialize A the same way as the default for nn.Linear and B to zero
+                nn.init.zeros_(self.lora_A)
+                nn.init.normal_(self.lora_B)
+            elif self.init_method=='A_normal_B_zero' or self.frozen_part=='A':
+                nn.init.normal_(self.lora_A)
+                nn.init.zeros_(self.lora_B)
+            elif self.init_method=='random_BA' and self.frozen_part== None:
+                seed_torch(self.init_seed)
+                self.lora_A = nn.Parameter(torch.randn(self.r, self.num_embeddings),requires_grad=True)
+                seed_torch(self.init_seed+1)
+                self.lora_B = nn.Parameter(torch.randn(self.embedding_dim, self.r),requires_grad=True)        
 
     def train(self, mode: bool = True):
         nn.Embedding.train(self, mode)
@@ -98,20 +148,33 @@ class Linear(nn.Linear, LoRALayer):
         lora_dropout: float = 0.,
         fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         merge_weights: bool = True,
+        init_state: tuple = ('A_kaiming_B_zero',4),
+        use_scaling: bool = True,
+        frozen_part: str = None,
         **kwargs
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-                           merge_weights=merge_weights)
+                           merge_weights=merge_weights, init_state=init_state, use_scaling=use_scaling,
+                           frozen_part=frozen_part)
 
         self.fan_in_fan_out = fan_in_fan_out
         # Actual trainable parameters
         if r > 0:
             self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
-            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
-            self.scaling = self.lora_alpha / self.r
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))        
+            if self.use_scaling:
+                self.scaling = self.lora_alpha / self.r
+            else:
+                self.scaling = 1
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
+            if self.frozen_part == 'A':
+                self.lora_A.requires_grad = False
+            elif self.frozen_part=='B':
+                self.lora_B.requires_grad = False
+        
+        
         self.reset_parameters()
         if fan_in_fan_out:
             self.weight.data = self.weight.data.transpose(0, 1)
@@ -119,9 +182,22 @@ class Linear(nn.Linear, LoRALayer):
     def reset_parameters(self):
         nn.Linear.reset_parameters(self)
         if hasattr(self, 'lora_A'):
-            # initialize A the same way as the default for nn.Linear and B to zero
-            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B)
+            # nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            # nn.init.zeros_(self.lora_B)
+            seed_torch(self.init_seed)
+            if self.init_method=='A_zero_B_kaiming' or self.frozen_part=='B':
+                # original initialization
+                nn.init.zeros_(self.lora_A)
+                nn.init.kaiming_uniform_(self.lora_B, a=math.sqrt(5))
+            elif self.init_method=='A_kaiming_B_zero' or self.frozen_part=='A':
+                # initialize A the same way as the default for nn.Linear and B to zero
+                nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B)
+            elif self.init_method=='random_BA' and self.frozen_part== None:
+                seed_torch(self.init_seed)
+                self.lora_A = nn.Parameter(torch.randn(self.r, self.in_features),requires_grad=True)
+                seed_torch(self.init_seed+1)
+                self.lora_B = nn.Parameter(torch.randn(self.out_features, self.r),requires_grad=True)        
 
     def train(self, mode: bool = True):
         def T(w):
